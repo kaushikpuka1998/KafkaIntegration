@@ -12,8 +12,9 @@ Two Spring Boot services that talk through Apache Kafka, using the **Transaction
                 │                    OrderKafkaProducer ──► topic "order-created" (key = orderId)    │
                 └──────────────────────────────────────────────────┬───────────────────────────────┘
                                                                    ▼
-                ┌──────────────── kafkaIntegrationConsumer (:8082) ─────────────────┐
+                ┌──────────────── kafkaIntegrationConsumer (:8082) ──────────────────┐
                 │ OrderKafkaConsumer (@KafkaListener, group "order-service")         │
+                │   → markProcessed(orderId) in processed_orders; 0 → skip dup       │
                 │   → prints value, partition, offset, key                           │
                 └────────────────────────────────────────────────────────────────────┘
 ```
@@ -26,7 +27,7 @@ Two Spring Boot services that talk through Apache Kafka, using the **Transaction
 | Java | 17 | 17 |
 | Build | Gradle (wrapper included) | Gradle (wrapper included) |
 | Kafka | spring-kafka | spring-kafka |
-| DB | PostgreSQL + Spring Data JPA | PostgreSQL driver/JPA on classpath (not used yet) |
+| DB | PostgreSQL + Spring Data JPA | PostgreSQL + Spring Data JPA (dedupe table) |
 | Other | Lombok, Validation, Redis starter (not used yet), DevTools | Lombok, Validation, DevTools |
 
 ## Project layout
@@ -58,8 +59,10 @@ Kafka-Integration/
     ├── build.gradle
     └── src/main/java/com/kgstrivers/kafkaIntegrationConsumer/
         ├── KafkaIntegrationConsumerApplication.java
+        ├── Entities/ProcessedOrder.java          # table "processed_orders" (dedupe)
         ├── Events/OrderCreatedEvent.java         # consumer's own copy of the payload
-        └── Kafka/OrderKafkaConsumer.java         # @KafkaListener on "order-created"
+        ├── Kafka/OrderKafkaConsumer.java         # @KafkaListener on "order-created", dedupes
+        └── Repositories/ProcessedOrderRepository.java  # markProcessed(orderId)
 ```
 
 ---
@@ -159,13 +162,20 @@ Spring Boot entry point.
 The consumer's **own** copy of the event (`orderId`, `product`, `amount`) in its own package. The services share no code — only the JSON shape.
 
 ### `Kafka/OrderKafkaConsumer`
-`@KafkaListener(topics = "order-created", groupId = "order-service")`. Receives `ConsumerRecord<String, OrderCreatedEvent>` and prints the value, partition, offset and key.
+`@KafkaListener(topics = "order-created", groupId = "order-service")`, `@Transactional`. Receives `ConsumerRecord<String, OrderCreatedEvent>`, dedupes on `orderId`, then prints the value, partition, offset and key.
+
+### Idempotency (dedupe on `orderId`)
+- `Entities/ProcessedOrder` → table `processed_orders` (`order_id` PK, `processed_at`).
+- `Repositories/ProcessedOrderRepository.markProcessed(orderId)` runs `INSERT ... ON CONFLICT DO NOTHING` and returns `1` (new) or `0` (already seen). One atomic statement, so it's race-safe even across rebalances.
+- The listener calls it first; `0` → log and skip. The marker and the processing share one DB transaction, so a crash before commit rolls both back and the redelivered message is processed normally.
+- Offsets are committed after the listener returns, so a crash after the DB commit but before the offset commit just causes a redelivery that gets skipped.
 
 ### Consumer configuration (`application.properties`)
 
 | Property | Value | Why |
 |---|---|---|
 | `server.port` | `8082` | |
+| `spring.jpa.hibernate.ddl-auto` | `update` | creates `processed_orders` |
 | `spring.kafka.bootstrap-servers` | `localhost:9092` | |
 | `spring.kafka.consumer.auto-offset-reset` | `earliest` | read from the beginning for new groups |
 | `key-deserializer` | `StringDeserializer` | |
@@ -185,7 +195,7 @@ You need three things running before the services start:
 | Component | Version | Address | Used by |
 |---|---|---|---|
 | Java (JDK) | 17+ | – | both services |
-| PostgreSQL | 14+ | `localhost:5432`, DB `kafka_demo`, user `postgres` / pw `1998` | producer |
+| PostgreSQL | 14+ | `localhost:5432`, DB `kafka_demo`, user `postgres` / pw `1998` | both services |
 | Apache Kafka | 3.7+ (KRaft, no ZooKeeper) | `localhost:9092` | both services |
 
 Gradle does **not** need to be installed — each module ships with `./gradlew`.
@@ -380,7 +390,7 @@ Each module has a `contextLoads()` smoke test (needs Postgres and Kafka running)
 ## Known caveats
 
 - **Outbox marks `PUBLISHED` before Kafka ACKs.** `publishOrderCreated` is async; the row is saved as `PUBLISHED` right after `send()` is called, so a failed send is only logged, not retried. Fix: wait on the send future (`.get()`) or update status inside `whenComplete`.
-- **At-least-once delivery.** If the app dies between sending and saving `PUBLISHED`, the event is re-sent. Consumers should be idempotent (dedupe on `orderId`).
+- **At-least-once delivery.** If the app dies between sending and saving `PUBLISHED`, the event is re-sent. The consumer handles this by deduping on `orderId` (see *Idempotency*).
 - **Two Jackson versions.** `OrderService` uses `com.fasterxml.jackson` (Jackson 2, from `JacksonConfig`); `Outboxpublisher` uses `tools.jackson` (Jackson 3, Boot 4 default).
 - **Plaintext DB password** in `application.properties` — move to env vars (`SPRING_DATASOURCE_PASSWORD`) for anything beyond local dev.
-- Redis starter (producer) and JPA/Postgres (consumer) are on the classpath but unused.
+- Redis starter (producer) is on the classpath but unused.
